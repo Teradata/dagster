@@ -66,6 +66,15 @@ class TeradataResource(ConfigurableResource, IAttachDifferentObjectToOpContext):
         )
         yield teradata_conn
 
+    def get_object_to_set_on_execution_context(self) -> Any:
+        # Directly create a TeradataConnection here for backcompat since the TeradataConnection
+        # has methods this resource does not have
+        return TeradataConnection(
+            config=self._resolved_config_dict,
+            log=get_dagster_logger(),
+            teradata_connection_resource=self,
+        )
+
 
 class TeradataConnection:
     """A connection to Teradata that can execute queries. In general this class should not be
@@ -247,7 +256,9 @@ class TeradataConnection:
 
     @public
     def azure_blob_to_teradata(
-            azure_blob: AzureBlobResource,
+            self,
+            azure_client_id: str,
+            azure_client_secret: str,
             blob_source_key: str,
             teradata_table: str,
             public_bucket: bool = False,
@@ -278,9 +289,7 @@ class TeradataConnection:
                 credentials_part = f"AUTHORIZATION={teradata_authorization_name}"
             else:
                 # Obtaining Azure client ID and secret from the azure_blob resource
-                access_id = azure_blob.azure_client_id
-                access_secret = azure_blob.azure_client_secret
-                credentials_part = f"ACCESS_ID= '{access_id}' ACCESS_KEY= '{access_secret}'"
+                credentials_part = f"ACCESS_ID= '{azure_client_id}' ACCESS_KEY= '{azure_client_secret}'"
 
         sql = dedent(f"""
                     CREATE MULTISET TABLE {teradata_table} AS
