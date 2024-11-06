@@ -35,6 +35,9 @@ setup(
     python_requires=">=3.8,<3.13",
     install_requires=[
         f"dagster{pin}",
+        "pytest",
+        "pandas",
+        "dagster-aws",
         "teradatasql",
     ],
     zip_safe=False,
