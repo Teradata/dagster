@@ -65,19 +65,19 @@ def test_resource(tmp_path):
     materialize(
         [drop_table, create_table, insert_rows, read_table],
         resources={"teradata": TeradataResource(
-            host="sdt47039.labs.teradata.com",
-            user="mt255026",
-            password="mt255026",
-            database="mt255026")},
+            host=os.getenv("TERADATA_HOST"),
+            user=os.getenv("TERADATA_USER"),
+            password=os.getenv("TERADATA_PASSWORD"),
+            database=os.getenv("TERADATA_DATABASE"))},
     )
 
 @pytest.mark.integration
 def test_resources_teradata_connection():
     with TeradataResource(
-        host="sdt47039.labs.teradata.com",
-        user="mt255026",
-        password="mt255026",
-        database="mt255026",
+        host=os.getenv("TERADATA_HOST"),
+        user=os.getenv("TERADATA_USER"),
+        password=os.getenv("TERADATA_PASSWORD"),
+        database=os.getenv("TERADATA_DATABASE"),
     ).get_connection() as conn:
         # Teradata table names are expected to be capitalized.
         table_name = f"test_table_{str(uuid.uuid4()).replace('-', '_')}".lower()
@@ -89,7 +89,7 @@ def test_resources_teradata_connection():
 
             freshness_for_table = fetch_last_updated_timestamps(
                 teradata_connection=conn,
-                database="mt255026",
+                database=os.getenv("TERADATA_PASSWORD"),
                 tables=[
                     table_name
                 ],  # Teradata table names are expected uppercase. Test that lowercase also works.
@@ -97,98 +97,7 @@ def test_resources_teradata_connection():
 
             end_time = get_current_timestamp()
 
-            assert end_time > freshness_for_table
-        finally:
-            try:
-                conn.cursor().execute(f"drop table if exists {table_name}")
-            except Exception as ex:
-                ignored = False
-                if f"[Error 3807]" in str(ex):
-                    ignored = True
-
-
-def test_s3_to_teradata():
-    with TeradataResource(
-        host="sdt47039.labs.teradata.com",
-        user="mt255026",
-        password="mt255026",
-        database="mt255026",
-    ).get_connection() as conn:
-        # Teradata table names are expected to be capitalized.
-        table_name = f"test_table_{str(uuid.uuid4()).replace('-', '_')}".lower()
-        try:
-
-
-            start_time = get_current_timestamp()
-            conn.cursor().execute(f"create table {table_name} (foo varchar(10))")
-            # Insert one row
-            conn.cursor().execute(f"insert into {table_name} values ('bar')")
-            freshness_for_table = fetch_last_updated_timestamps(
-                teradata_connection=conn,
-                database="mt255026",
-                tables=[
-                    table_name
-                ],  # Teradata table names are expected uppercase. Test that lowercase also works.
-            )[table_name].timestamp()
-            end_time = get_current_timestamp()
-            assert end_time > freshness_for_table
-        finally:
-            try:
-                conn.cursor().execute(f"drop table if exists {table_name}")
-            except Exception as ex:
-                ignored = False
-                if f"[Error 3807]" in str(ex):
-                    ignored = True
-
-
-
-
-
-@pytest.mark.integration
-def test_s3_to_teradata(tmp_path):
-
-
-    @op(required_resource_keys={'teradata'})
-    def get_one(context):
-        context.resources.teradata.execute_query('SELECT 1')
-
-
-    materialize(
-        [drop_table, create_table, insert_rows, read_table],
-        resources={"teradata": TeradataResource(
-            host="sdt47039.labs.teradata.com",
-            user="mt255026",
-            password="mt255026",
-            database="mt255026")},
-    )
-
-@pytest.mark.integration
-def test_resources_teradata_connection():
-    with TeradataResource(
-        host="sdt47039.labs.teradata.com",
-        user="mt255026",
-        password="mt255026",
-        database="mt255026",
-    ).get_connection() as conn:
-        # Teradata table names are expected to be capitalized.
-        table_name = f"test_table_{str(uuid.uuid4()).replace('-', '_')}".lower()
-        try:
-            start_time = get_current_timestamp()
-            conn.cursor().execute(f"create table {table_name} (foo varchar(10))")
-            # Insert one row
-            conn.cursor().execute(f"insert into {table_name} values ('bar')")
-
-            freshness_for_table = fetch_last_updated_timestamps(
-                teradata_connection=conn,
-                database="mt255026",
-                tables=[
-                    table_name
-                ],  # Teradata table names are expected uppercase. Test that lowercase also works.
-            )[table_name].timestamp()
-
-            end_time = get_current_timestamp()
-
-            assert end_time > freshness_for_table
+            assert freshness_for_table > start_time
         finally:
             try:
                 conn.cursor().execute(f"drop table if exists {table_name}")
