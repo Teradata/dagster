@@ -5,12 +5,15 @@ from contextlib import closing, contextmanager
 from datetime import datetime
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Union
 from textwrap import dedent
+import botocore.session
+
+
 import dagster._check as check
 from dagster import (
     ConfigurableResource,
     IAttachDifferentObjectToOpContext,
     get_dagster_logger,
-    resource,
+    resource, DagsterError,
 )
 from dagster._utils.cached_method import cached_method
 from dagster._annotations import public
@@ -78,6 +81,7 @@ class TeradataResource(ConfigurableResource, IAttachDifferentObjectToOpContext):
 
 class TeradataConnection:
     CC_GRP_LAKE_SUPPORT_ONLY_MSG = "Compute Groups is supported only on Vantage Cloud Lake."
+    CC_OPR_EMPTY_PROFILE_ERROR_MSG = "Please provide a valid name for the compute cluster profile."
 
     """A connection to Teradata that can execute queries. In general this class should not be
     directly instantiated, but rather used as a resource in an op or asset via the
@@ -129,6 +133,7 @@ class TeradataConnection:
             self,
             sql: str,
             fetch_results: bool = False,
+            single_result_row: bool = False,
     ):
         """Execute a query in Teradata.
 
@@ -151,7 +156,10 @@ class TeradataConnection:
                 self.log.info("Executing query: " + sql)
                 cursor.execute(sql)
                 if fetch_results:
-                    return cursor.fetchall()
+                    if single_result_row:
+                        return self._single_result_row_handler(cursor)
+                    else:
+                        return cursor.fetchall()
 
     @public
     def execute_queries(
@@ -186,11 +194,13 @@ class TeradataConnection:
                     parameters = dict(parameters) if isinstance(parameters, Mapping) else parameters
                     cursor.execute(sql, parameters)
                     if fetch_results:
-                        results = results.append(cursor.fetch_pandas_all())  # type: ignore
+                        results = results.append(cursor.fetchall())  # type: ignore
+                        return results
+
     @public
     def s3_to_teradata(
             self,
-            s3: S3Resource,
+            s3_resource,
             s3_source_key: str,
             teradata_table: str,
             public_bucket: bool = False,
@@ -241,10 +251,16 @@ class TeradataConnection:
             if teradata_authorization_name:
                 credentials_part = f"AUTHORIZATION={teradata_authorization_name}"
             else:
-                access_key = s3.aws_access_key_id
-                access_secret = s3.aws_secret_access_key
+                session = s3_resource.create_session(Bucket='mt255026-test')
+                s3_client = session.create_client('s3')
+                credentials = s3_client.get_credentials()
+                access_key = credentials.access_key
+                access_secret = credentials.secret_key
+                token = credentials.token
+                # access_key = s3_client.aws_access_key_id
+                # access_secret = s3_client.aws_secret_access_key
                 credentials_part = f"ACCESS_ID= '{access_key}' ACCESS_KEY= '{access_secret}'"
-                token = s3.aws_session_token
+                # token = s3_client.aws_session_token
                 if token:
                     credentials_part = credentials_part + f" SESSION_TOKEN = '{token}'"
 
@@ -261,7 +277,7 @@ class TeradataConnection:
         self.execute_queries(sql)
 
     # Handler to handle single result set of a SQL query
-    def _single_result_row_handler(cursor):
+    def _single_result_row_handler(self, cursor):
         records = cursor.fetchone()
         if isinstance(records, list):
             return records[0]
@@ -269,10 +285,42 @@ class TeradataConnection:
             return records
         raise TypeError(f"Unexpected results: {cursor.fetchone()!r}")
 
+
+    def verify_compute_cluster(self,
+                               compute_profile_name: str):
+        if (
+                compute_profile_name is None
+                or compute_profile_name == "None"
+                or compute_profile_name == ""
+        ):
+            self.log.info("Invalid compute cluster profile name")
+            raise DagsterError(self.CC_OPR_EMPTY_PROFILE_ERROR_MSG)
+
+        # Getting teradata db version. Considering teradata instance is Lake when db version is 20 or above
+        db_version_get_sql = "SELECT  InfoData AS Version FROM DBC.DBCInfoV WHERE InfoKey = 'VERSION'"
+        try:
+            db_version_result = self.execute_query(db_version_get_sql, True, True)
+            if db_version_result is not None:
+                db_version_result = str(db_version_result)
+                db_version = db_version_result.split(".")[0]
+                if db_version is not None and int(db_version) < 20:
+                    raise DagsterError(self.CC_GRP_LAKE_SUPPORT_ONLY_MSG)
+            else:
+                raise Exception("Error occurred while getting teradata database version")
+        except teradatasql.DatabaseError as ex:
+            self.log.error("Error occurred while getting teradata database version: %s ", str(ex))
+            raise Exception("Error occurred while getting teradata database version")
+
+        lake_support_find_sql = "SELECT count(1) from DBC.StorageV WHERE StorageName='TD_OFSSTORAGE'"
+        lake_support_result = self.execute_query(lake_support_find_sql, True, True)
+        if lake_support_result is None:
+            raise DagsterError(self.CC_GRP_LAKE_SUPPORT_ONLY_MSG)
+
+
     def create_teradata_compute_cluster(
             self,
-            compute_group_name: str,
             compute_profile_name: str,
+            compute_group_name: str,
             query_strategy: str = "STANDARD",
             compute_map: str = None,
             compute_attribute: str = None
@@ -288,71 +336,61 @@ class TeradataConnection:
             compute_attribute (str, optional): Additional attributes for compute profile. Defaults to None.
         """
 
-        lake_support_find_sql = "SELECT count(1) from DBC.StorageV WHERE StorageName='TD_OFSSTORAGE'"
-        lake_support_result = self.hook.run(lake_support_find_sql, handler=_single_result_row_handler)
-        if lake_support_result is None:
-            raise Exception(self.CC_GRP_LAKE_SUPPORT_ONLY_MSG)
-        # Getting teradata db version. Considering teradata instance is Lake when db version is 20 or above
-        db_version_get_sql = "SELECT  InfoData AS Version FROM DBC.DBCInfoV WHERE InfoKey = 'VERSION'"
-        try:
-            db_version_result = self.hook.run(db_version_get_sql, handler=_single_result_row_handler)
-            if db_version_result is not None:
-                db_version_result = str(db_version_result)
-                db_version = db_version_result.split(".")[0]
-                if db_version is not None and int(db_version) < 20:
-                    raise Exception(self.CC_GRP_LAKE_SUPPORT_ONLY_MSG)
+        self.verify_compute_cluster(compute_profile_name)
+
+        if compute_group_name:
+            # Step 1: Check if the compute group exists
+            check_compute_group_sql = dedent(f"""
+                SELECT count(1) FROM DBC.ComputeGroups 
+                WHERE UPPER(ComputeGroupName) = UPPER('{compute_group_name}')
+            """)
+            cg_status_result = self.execute_query(check_compute_group_sql, True, True)
+            if cg_status_result is not None:
+                cg_status_result = str(cg_status_result)
             else:
-                raise Exception("Error occurred while getting teradata database version")
-        except Exception as ex:
-            self.log.error("Error occurred while getting teradata database version: %s ", str(ex))
-            raise Exception("Error occurred while getting teradata database version")
+                cg_status_result = 0
 
-        # Step 1: Check if the compute group exists
-        check_compute_group_sql = dedent(f"""
-            SELECT count(1) FROM DBC.ComputeGroups 
-            WHERE UPPER(ComputeGroupName) = UPPER('{compute_group_name}')
-        """)
-        self.execute_query(check_compute_group_sql)
-
-        # Step 2: Create the compute group if it doesn't exist
-        create_compute_group_sql = dedent(f"""
-            CREATE COMPUTE GROUP {compute_group_name} 
-            USING QUERY_STRATEGY ('{query_strategy}')
-        """)
-        self.execute_query(create_compute_group_sql)
+            # Step 2: Create the compute group if it doesn't exist
+            if int(cg_status_result) == 0:
+                create_cg_query = "CREATE COMPUTE GROUP " + compute_group_name
+                if query_strategy is not None:
+                    create_cg_query = (
+                        create_cg_query + " USING QUERY_STRATEGY ('" + query_strategy + "')"
+                    )
+                self.execute_query(create_cg_query)
 
         # Step 3: Check if the compute profile exists within the compute group
-        check_compute_profile_sql = dedent(f"""
-            SELECT ComputeProfileState 
-            FROM DBC.ComputeProfilesVX 
-            WHERE UPPER(ComputeProfileName) = UPPER('{compute_profile_name}') 
-            AND UPPER(ComputeGroupName) = UPPER('{compute_group_name}')
-        """)
-        self.execute_query(check_compute_profile_sql)
+        cp_status_query = (
+                "SEL ComputeProfileState FROM DBC.ComputeProfilesVX WHERE UPPER(ComputeProfileName) = UPPER('"
+                + compute_profile_name
+                + "')"
+        )
+        if compute_group_name:
+            cp_status_query += " AND UPPER(ComputeGroupName) = UPPER('" + compute_group_name + "')"
+        cp_status_result = self.execute_query(cp_status_query, True, True)
+        if cp_status_result is not None:
+            cp_status_result = str(cp_status_result)
+            msg = f"Compute Profile {compute_profile_name} is already exists under Compute Group {compute_group_name}. Status is {cp_status_result}"
+            self.log.info(msg)
+            return cp_status_result
+        else:
+            create_cp_query = "CREATE COMPUTE PROFILE " + compute_profile_name
+            if compute_group_name:
+                create_cp_query = create_cp_query + " IN " + compute_group_name
+            if compute_map is not None:
+                create_cp_query = create_cp_query + ", INSTANCE = " + compute_map
+            if query_strategy is not None:
+                create_cp_query = create_cp_query + ", INSTANCE TYPE = " + query_strategy
+            if compute_attribute is not None:
+                create_cp_query = create_cp_query + " USING " + compute_attribute
 
-        # Step 4: Create the compute profile if it doesn't exist
-        compute_profile_sql = dedent(f"""
-            CREATE COMPUTE PROFILE {compute_profile_name} 
-            IN {compute_group_name}, 
-            INSTANCE = {compute_map if compute_map else 'DEFAULT'}, 
-            INSTANCE TYPE = {query_strategy} 
-            {f'USING {compute_attribute}' if compute_attribute else ''}
-        """)
-        self.execute_query(compute_profile_sql)
-
-        # Step 5: Resume the compute profile to make it active
-        resume_profile_sql = dedent(f"""
-            RESUME COMPUTE FOR COMPUTE PROFILE {compute_profile_name} 
-            IN COMPUTE GROUP {compute_group_name}
-        """)
-        self.execute_query(resume_profile_sql)
-
-        # Compute cluster has been successfully created and activated.
+            self.execute_query(create_cp_query)
 
     def drop_teradata_compute_cluster(
             self,
-            compute_group_name: str,
             compute_profile_name: str,
+            compute_group_name: str,
+            delete_compute_group: bool = False,
     ):
         """
         Drops a compute cluster in Teradata by removing the compute profile and group.
@@ -362,44 +400,21 @@ class TeradataConnection:
             compute_profile_name (str): Name of the compute profile to drop within the group.
         """
 
-        # Step 1: Check if the compute profile exists
-        check_compute_profile_sql = dedent(f"""
-            SELECT COUNT(1) 
-            FROM DBC.ComputeProfilesVX 
-            WHERE UPPER(ComputeProfileName) = UPPER('{compute_profile_name}') 
-            AND UPPER(ComputeGroupName) = UPPER('{compute_group_name}')
-        """)
+        self.verify_compute_cluster(compute_profile_name)
 
-        profile_exists = self.execute_query(check_compute_profile_sql)
-
-        # Step 2: Drop the compute profile if it exists
-        if profile_exists:
-            drop_profile_sql = dedent(f"""
-                DROP COMPUTE PROFILE {compute_profile_name} 
-                IN COMPUTE GROUP {compute_group_name}
-            """)
-            self.execute_query(drop_profile_sql)
-
-            #Compute profile has been dropped
-
-        # Step 3: Check if the compute group exists
-        check_compute_group_sql = dedent(f"""
-            SELECT COUNT(1) 
-            FROM DBC.ComputeGroups 
-            WHERE UPPER(ComputeGroupName) = UPPER('{compute_group_name}')
-        """)
-
-        group_exists = self.execute_query(check_compute_group_sql)
-
-        # Step 4: Drop the compute group if it exists
-        if group_exists:
-            drop_group_sql = dedent(f"""
-                DROP COMPUTE GROUP {compute_group_name}
-            """)
-            self.execute_query(drop_group_sql)
-            #Compute group has been dropped
-
-            #Drop operation for compute cluster has been completed
+        cp_drop_query = "DROP COMPUTE PROFILE " + compute_profile_name
+        if compute_group_name:
+            cp_drop_query = cp_drop_query + " IN COMPUTE GROUP " + compute_group_name
+        self.execute_query(cp_drop_query)
+        self.log.info(
+            "Compute Profile %s IN Compute Group %s is successfully dropped",
+            compute_profile_name,
+            compute_group_name,
+        )
+        if delete_compute_group:
+            cg_drop_query = "DROP COMPUTE GROUP " + compute_group_name
+            self.execute_query(cg_drop_query)
+            self.log.info("Compute Group %s is successfully dropped", compute_group_name)
 
     @public
     def azure_blob_to_teradata(
