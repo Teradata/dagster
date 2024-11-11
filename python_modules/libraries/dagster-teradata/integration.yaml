@@ -1,0 +1,5 @@
+name: dagster-teradata
+suspended: false
+owner: Teradata
+maintainer_type: community
+maintainer_email: mohan.talla@teradata.com
