@@ -1,28 +1,22 @@
-import base64
-import sys
-import warnings
 from contextlib import closing, contextmanager
 from datetime import datetime
-from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Union
 from textwrap import dedent
-import botocore.session
-
+from typing import Any, Iterator, List, Mapping, Optional, Sequence, Union
 
 import dagster._check as check
+import teradatasql
 from dagster import (
     ConfigurableResource,
     IAttachDifferentObjectToOpContext,
     get_dagster_logger,
     resource, DagsterError,
 )
-from dagster._utils.cached_method import cached_method
 from dagster._annotations import public
 from dagster._core.definitions.resource_definition import dagster_maintained_resource
 from dagster._core.storage.event_log.sql_event_log import SqlDbConnection
+from dagster._utils.cached_method import cached_method
 from dagster_aws.s3 import S3Resource
-from pydantic import Field, validator
-
-import teradatasql
+from pydantic import Field
 
 
 class TeradataResource(ConfigurableResource, IAttachDifferentObjectToOpContext):
@@ -177,7 +171,7 @@ class TeradataConnection:
 
                 @op
                 def create_fresh_database(teradata: TeradataResource):
-                    queries = ["DROP DATABASE IF EXISTS MY_DATABASE", "CREATE DATABASE MY_DATABASE"]
+                    queries = ["DROP DATABASE MY_DATABASE", "CREATE DATABASE MY_DATABASE"]
                     teradata.execute_queries(
                         sql_queries=queries
                     )
@@ -188,11 +182,9 @@ class TeradataConnection:
         results: List[Any] = []
         with self.get_connection() as conn:
             with closing(conn.cursor()) as cursor:
-                for raw_sql in sql_queries:
-                    sql = raw_sql.encode("utf-8") if sys.version_info[0] < 3 else raw_sql
+                for sql in sql_queries:
                     self.log.info("Executing query: " + sql)
-                    parameters = dict(parameters) if isinstance(parameters, Mapping) else parameters
-                    cursor.execute(sql, parameters)
+                    cursor.execute(sql)
                     if fetch_results:
                         results = results.append(cursor.fetchall())  # type: ignore
                         return results
@@ -200,7 +192,7 @@ class TeradataConnection:
     @public
     def s3_to_teradata(
             self,
-            s3_resource,
+            s3: S3Resource,
             s3_source_key: str,
             teradata_table: str,
             public_bucket: bool = False,
@@ -251,16 +243,10 @@ class TeradataConnection:
             if teradata_authorization_name:
                 credentials_part = f"AUTHORIZATION={teradata_authorization_name}"
             else:
-                session = s3_resource.create_session(Bucket='mt255026-test')
-                s3_client = session.create_client('s3')
-                credentials = s3_client.get_credentials()
-                access_key = credentials.access_key
-                access_secret = credentials.secret_key
-                token = credentials.token
-                # access_key = s3_client.aws_access_key_id
-                # access_secret = s3_client.aws_secret_access_key
+                access_key = s3.aws_access_key_id
+                access_secret = s3.aws_secret_access_key
+                token = s3.aws_session_token
                 credentials_part = f"ACCESS_ID= '{access_key}' ACCESS_KEY= '{access_secret}'"
-                # token = s3_client.aws_session_token
                 if token:
                     credentials_part = credentials_part + f" SESSION_TOKEN = '{token}'"
 
@@ -274,7 +260,7 @@ class TeradataConnection:
                     ) WITH DATA
                     """).rstrip()
 
-        self.execute_queries(sql)
+        self.execute_query(sql)
 
     # Handler to handle single result set of a SQL query
     def _single_result_row_handler(self, cursor):
@@ -329,11 +315,16 @@ class TeradataConnection:
         Creates a compute cluster in Teradata by setting up a compute group and profile if they don't already exist.
 
         Args:
-            compute_group_name (str): Name of the compute group to create or check for.
-            compute_profile_name (str): Name of the compute profile within the group.
-            query_strategy (str, optional): Strategy for query execution, e.g., 'STANDARD' or 'ANALYTIC'. Defaults to 'STANDARD'.
-            compute_map (str, optional): Instance map for compute profile configuration. Defaults to None.
-            compute_attribute (str, optional): Additional attributes for compute profile. Defaults to None.
+            compute_profile_name: Name of the Compute Profile to manage.
+            compute_group_name: Name of compute group to which compute profile belongs.
+            query_strategy: Query strategy to use. Refers to the approach or method used by the
+                    Teradata Optimizer to execute SQL queries efficiently within a Teradata computer cluster.
+                    Valid query_strategy value is either 'STANDARD' or 'ANALYTIC'. Default at database level is STANDARD
+            compute_map: ComputeMapName of the compute map. The compute_map in a compute cluster profile refers
+                    to the mapping of compute resources to a specific node or set of nodes within the cluster.
+            compute_attribute: Optional attributes of compute profile. Example compute attribute
+                    MIN_COMPUTE_COUNT(1) MAX_COMPUTE_COUNT(5) INITIALLY_SUSPENDED('FALSE')
+                       compute_attribute (str, optional): Additional attributes for compute profile. Defaults to None.
         """
 
         self.verify_compute_cluster(compute_profile_name)
@@ -396,8 +387,11 @@ class TeradataConnection:
         Drops a compute cluster in Teradata by removing the compute profile and group.
 
         Args:
-            compute_group_name (str): Name of the compute group to drop.
-            compute_profile_name (str): Name of the compute profile to drop within the group.
+            compute_profile_name: Name of the Compute Profile to manage.
+            compute_group_name: Name of compute group to which compute profile belongs.
+            delete_compute_group: Indicates whether the compute group should be deleted.
+                When set to True, it signals the system to remove the specified compute group.
+                Conversely, when set to False, no action is taken on the compute group.
         """
 
         self.verify_compute_cluster(compute_profile_name)

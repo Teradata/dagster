@@ -7,15 +7,23 @@ from dagster_aws.s3 import s3_resource
 
 
 @pytest.mark.integration
-def test_s3_to_teradata(tmp_path):
+def test_example_drop_teradata_compute_cluster(tmp_path):
     @op(required_resource_keys={'teradata', 's3'})
-    def example_s3_op(context):
-        context.resources.teradata.drop_teradata_compute_cluster('ShippingCG01', 'Shipping')
+    def example_drop_teradata_compute_cluster(context):
+        """
+        Args for drop_teradata_compute_cluster():
+            compute_profile_name: Name of the Compute Profile to manage.
+            compute_group_name: Name of compute group to which compute profile belongs.
+            delete_compute_group: Indicates whether the compute group should be deleted.
+                When set to True, it signals the system to remove the specified compute group.
+                Conversely, when set to False, no action is taken on the compute group.
+        """
+        context.resources.teradata.drop_teradata_compute_cluster('ShippingCG01', 'Shipping', True)
 
 
     @job(resource_defs={'teradata': teradata_resource, 's3': s3_resource})
     def example_job():
-        example_s3_op()
+        example_drop_teradata_compute_cluster()
 
     example_job.execute_in_process(
         run_config={
