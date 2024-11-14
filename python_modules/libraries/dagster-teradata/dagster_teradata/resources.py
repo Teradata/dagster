@@ -1,3 +1,5 @@
+import asyncio
+import re
 from contextlib import closing, contextmanager
 from datetime import datetime
 from textwrap import dedent
@@ -9,7 +11,7 @@ from dagster import (
     ConfigurableResource,
     IAttachDifferentObjectToOpContext,
     get_dagster_logger,
-    resource, DagsterError,
+    resource, DagsterError, DagsterEvent, DagsterEventType, DagsterRun
 )
 from dagster._annotations import public
 from dagster._core.definitions.resource_definition import dagster_maintained_resource
@@ -18,6 +20,7 @@ from dagster._utils.cached_method import cached_method
 from dagster_aws.s3 import S3Resource
 from pydantic import Field
 
+from dagster_teradata import constants
 
 class TeradataResource(ConfigurableResource, IAttachDifferentObjectToOpContext):
     host: str = Field(default=None, description="Teradata Database Hostname")
@@ -74,8 +77,6 @@ class TeradataResource(ConfigurableResource, IAttachDifferentObjectToOpContext):
 
 
 class TeradataConnection:
-    CC_GRP_LAKE_SUPPORT_ONLY_MSG = "Compute Groups is supported only on Vantage Cloud Lake."
-    CC_OPR_EMPTY_PROFILE_ERROR_MSG = "Please provide a valid name for the compute cluster profile."
 
     """A connection to Teradata that can execute queries. In general this class should not be
     directly instantiated, but rather used as a resource in an op or asset via the
@@ -262,6 +263,55 @@ class TeradataConnection:
 
         self.execute_query(sql)
 
+    @public
+    def azure_blob_to_teradata(
+            self,
+            azure_client_id: str,
+            azure_client_secret: str,
+            blob_source_key: str,
+            teradata_table: str,
+            public_bucket: bool = False,
+            teradata_authorization_name: str = ""
+    ):
+        """Loads CSV, JSON, and Parquet format data from Azure Blob Storage to Teradata.
+
+        Args:
+            :param blob_source_key: The URI format specifying the location of the Azure blob object store.
+                The URI format is `/az/YOUR-STORAGE-ACCOUNT.blob.core.windows.net/YOUR-CONTAINER/YOUR-BLOB-LOCATION`.
+                Refer to
+                https://docs.teradata.com/search/documents?query=native+object+store&sort=last_update&virtual-field=title_only&content-lang=en-US
+            :param public_bucket: Specifies whether the provided blob container is public. If the blob container is public,
+                it means that anyone can access the objects within it via a URL without requiring authentication.
+                If the container is private and authentication is not provided, the function will raise an exception.
+            :param teradata_table: The name of the Teradata table to which the data is transferred.
+            :param teradata_authorization_name: The name of Teradata Authorization Database Object,
+                is used to control who can access an Azure Blob object store.
+                Refer to
+                https://docs.teradata.com/r/Enterprise_IntelliFlex_VMware/Teradata-VantageTM-Native-Object-Store-Getting-Started-Guide-17.20/Setting-Up-Access/Controlling-Foreign-Table-Access-with-an-AUTHORIZATION-Object
+        """
+
+        credentials_part = "ACCESS_ID= '' ACCESS_KEY= ''"
+
+        if not public_bucket:
+            # Accessing data directly from the Azure Blob Storage and creating permanent table inside the database
+            if teradata_authorization_name:
+                credentials_part = f"AUTHORIZATION={teradata_authorization_name}"
+            else:
+                # Obtaining Azure client ID and secret from the azure_blob resource
+                credentials_part = f"ACCESS_ID= '{azure_client_id}' ACCESS_KEY= '{azure_client_secret}'"
+
+        sql = dedent(f"""
+                    CREATE MULTISET TABLE {teradata_table} AS
+                    (
+                        SELECT * FROM (
+                            LOCATION = '{blob_source_key}'
+                            {credentials_part}
+                        ) AS d
+                    ) WITH DATA
+                    """).rstrip()
+
+        self.execute_queries(sql)
+
     # Handler to handle single result set of a SQL query
     def _single_result_row_handler(self, cursor):
         records = cursor.fetchone()
@@ -271,7 +321,6 @@ class TeradataConnection:
             return records
         raise TypeError(f"Unexpected results: {cursor.fetchone()!r}")
 
-
     def verify_compute_cluster(self,
                                compute_profile_name: str):
         if (
@@ -280,7 +329,7 @@ class TeradataConnection:
                 or compute_profile_name == ""
         ):
             self.log.info("Invalid compute cluster profile name")
-            raise DagsterError(self.CC_OPR_EMPTY_PROFILE_ERROR_MSG)
+            raise DagsterError(constants.CC_OPR_EMPTY_PROFILE_ERROR_MSG)
 
         # Getting teradata db version. Considering teradata instance is Lake when db version is 20 or above
         db_version_get_sql = "SELECT  InfoData AS Version FROM DBC.DBCInfoV WHERE InfoKey = 'VERSION'"
@@ -290,7 +339,7 @@ class TeradataConnection:
                 db_version_result = str(db_version_result)
                 db_version = db_version_result.split(".")[0]
                 if db_version is not None and int(db_version) < 20:
-                    raise DagsterError(self.CC_GRP_LAKE_SUPPORT_ONLY_MSG)
+                    raise DagsterError(constants.CC_GRP_LAKE_SUPPORT_ONLY_MSG)
             else:
                 raise Exception("Error occurred while getting teradata database version")
         except teradatasql.DatabaseError as ex:
@@ -300,8 +349,114 @@ class TeradataConnection:
         lake_support_find_sql = "SELECT count(1) from DBC.StorageV WHERE StorageName='TD_OFSSTORAGE'"
         lake_support_result = self.execute_query(lake_support_find_sql, True, True)
         if lake_support_result is None:
-            raise DagsterError(self.CC_GRP_LAKE_SUPPORT_ONLY_MSG)
+            raise DagsterError(constants.CC_GRP_LAKE_SUPPORT_ONLY_MSG)
 
+    def handle_cc_status(self, operation, create_cp_query, compute_profile_name, compute_group_name, timeout) -> str:
+        create_sql_result = self.execute_query(create_cp_query, True, True)
+        self.log.info(
+            "%s query ran successfully. Differing to trigger to check status in db. Result from sql: %s",
+            operation,
+            create_sql_result,
+        )
+
+        try:
+            while True:
+                status = self.get_status(compute_profile_name, compute_group_name)
+                if status is None or len(status) == 0:
+                    self.log.info(constants.CC_GRP_PRP_NON_EXISTS_MSG)
+                    raise DagsterError(constants.CC_GRP_PRP_NON_EXISTS_MSG)
+                if (
+                        operation == constants.CC_SUSPEND_OPR
+                        or operation == constants.CC_CREATE_SUSPEND_OPR
+                ):
+                    if status == constants.CC_SUSPEND_DB_STATUS:
+                        break
+                elif (
+                        operation == constants.CC_RESUME_OPR
+                        or operation == constants.CC_CREATE_OPR
+                ):
+                    if status == constants.CC_RESUME_DB_STATUS:
+                        break
+                if timeout is not None:
+                    timeout = float(timeout)
+                else:
+                    timeout = float(constants.CC_POLL_INTERVAL)
+                asyncio.sleep(timeout)
+            if (
+                    operation == constants.CC_SUSPEND_OPR
+                    or operation == constants.CC_CREATE_SUSPEND_OPR
+            ):
+                if status == constants.CC_SUSPEND_DB_STATUS:
+                    yield DagsterEvent(
+                        {
+                            "job_name" : DagsterRun.job_name,
+                            "event_type_value": DagsterEventType.STEP_SUCCESS,
+                            "message": constants.CC_OPR_SUCCESS_STATUS_MSG
+                                       % (compute_profile_name, operation),
+                        }
+                    )
+                else:
+                    yield DagsterEvent(
+                        {
+                            "job_name": DagsterRun.job_name,
+                            "event_type_value": DagsterEventType.STEP_FAILURE,
+                            "message": constants.CC_OPR_FAILURE_STATUS_MSG
+                                       % (compute_profile_name, operation),
+                        }
+                    )
+            elif (
+                    operation == constants.CC_RESUME_OPR
+                    or operation == constants.CC_CREATE_OPR
+            ):
+                if status == constants.CC_RESUME_DB_STATUS:
+                    yield DagsterEvent(
+                        {
+                            "job_name": DagsterRun.job_name,
+                            "event_type_value": DagsterEventType.STEP_SUCCESS,
+                            "message": constants.CC_OPR_SUCCESS_STATUS_MSG
+                                       % (compute_profile_name, operation),
+                        }
+                    )
+                else:
+                    yield DagsterEvent(
+                        {
+                            "job_name": DagsterRun.job_name,
+                            "event_type_value": DagsterEventType.STEP_FAILURE,
+                            "message": constants.CC_OPR_FAILURE_STATUS_MSG
+                                       % (compute_profile_name, operation),
+                        }
+                    )
+            else:
+                yield DagsterEvent({"status": "error", "message": "Invalid operation"})
+        except Exception as e:
+            yield DagsterError({"status": "error", "message": str(e)})
+        except asyncio.CancelledError:
+            self.log.error(constants.CC_OPR_TIMEOUT_ERROR, operation)
+        return create_sql_result
+
+    def get_status(self, compute_profile_name: str, compute_group_name: str) -> str:
+        sql = (
+                "SEL ComputeProfileState FROM DBC.ComputeProfilesVX WHERE UPPER(ComputeProfileName) = UPPER('"
+                + compute_profile_name
+                + "')"
+        )
+        if compute_group_name:
+            sql += " AND UPPER(ComputeGroupName) = UPPER('" + compute_group_name + "')"
+        result_set = self.execute_query(sql, True, True)
+        status = ""
+        if isinstance(result_set, list) and isinstance(result_set[0], str):
+            status = str(result_set[0])
+        return status
+
+    def get_initially_suspended(self, create_cp_query):
+        initially_suspended = "FALSE"
+        pattern = r"INITIALLY_SUSPENDED\s*\(\s*'(TRUE|FALSE)'\s*\)"
+        # Search for the pattern in the input string
+        match = re.search(pattern, create_cp_query, re.IGNORECASE)
+        if match:
+            # Get the value of INITIALLY_SUSPENDED
+            initially_suspended = match.group(1).strip().upper()
+        return initially_suspended
 
     def create_teradata_compute_cluster(
             self,
@@ -309,7 +464,8 @@ class TeradataConnection:
             compute_group_name: str,
             query_strategy: str = "STANDARD",
             compute_map: str = None,
-            compute_attribute: str = None
+            compute_attribute: str = None,
+            timeout: int = constants.CC_OPR_TIME_OUT,
     ):
         """
         Creates a compute cluster in Teradata by setting up a compute group and profile if they don't already exist.
@@ -374,8 +530,14 @@ class TeradataConnection:
                 create_cp_query = create_cp_query + ", INSTANCE TYPE = " + query_strategy
             if compute_attribute is not None:
                 create_cp_query = create_cp_query + " USING " + compute_attribute
+            operation = constants.CC_CREATE_OPR
+            initially_suspended = self.get_initially_suspended(create_cp_query)
+            if initially_suspended == "TRUE":
+                operation = constants.CC_CREATE_SUSPEND_OPR
+            for event in self.handle_cc_status(operation, create_cp_query, compute_profile_name, compute_group_name,
+                                               timeout):
+                self.log.info(event)
 
-            self.execute_query(create_cp_query)
 
     def drop_teradata_compute_cluster(
             self,
@@ -409,55 +571,6 @@ class TeradataConnection:
             cg_drop_query = "DROP COMPUTE GROUP " + compute_group_name
             self.execute_query(cg_drop_query)
             self.log.info("Compute Group %s is successfully dropped", compute_group_name)
-
-    @public
-    def azure_blob_to_teradata(
-            self,
-            azure_client_id: str,
-            azure_client_secret: str,
-            blob_source_key: str,
-            teradata_table: str,
-            public_bucket: bool = False,
-            teradata_authorization_name: str = ""
-    ):
-        """Loads CSV, JSON, and Parquet format data from Azure Blob Storage to Teradata.
-
-        Args:
-            :param blob_source_key: The URI format specifying the location of the Azure blob object store.
-                The URI format is `/az/YOUR-STORAGE-ACCOUNT.blob.core.windows.net/YOUR-CONTAINER/YOUR-BLOB-LOCATION`.
-                Refer to
-                https://docs.teradata.com/search/documents?query=native+object+store&sort=last_update&virtual-field=title_only&content-lang=en-US
-            :param public_bucket: Specifies whether the provided blob container is public. If the blob container is public,
-                it means that anyone can access the objects within it via a URL without requiring authentication.
-                If the container is private and authentication is not provided, the function will raise an exception.
-            :param teradata_table: The name of the Teradata table to which the data is transferred.
-            :param teradata_authorization_name: The name of Teradata Authorization Database Object,
-                is used to control who can access an Azure Blob object store.
-                Refer to
-                https://docs.teradata.com/r/Enterprise_IntelliFlex_VMware/Teradata-VantageTM-Native-Object-Store-Getting-Started-Guide-17.20/Setting-Up-Access/Controlling-Foreign-Table-Access-with-an-AUTHORIZATION-Object
-        """
-
-        credentials_part = "ACCESS_ID= '' ACCESS_KEY= ''"
-
-        if not public_bucket:
-            # Accessing data directly from the Azure Blob Storage and creating permanent table inside the database
-            if teradata_authorization_name:
-                credentials_part = f"AUTHORIZATION={teradata_authorization_name}"
-            else:
-                # Obtaining Azure client ID and secret from the azure_blob resource
-                credentials_part = f"ACCESS_ID= '{azure_client_id}' ACCESS_KEY= '{azure_client_secret}'"
-
-        sql = dedent(f"""
-                    CREATE MULTISET TABLE {teradata_table} AS
-                    (
-                        SELECT * FROM (
-                            LOCATION = '{blob_source_key}'
-                            {credentials_part}
-                        ) AS d
-                    ) WITH DATA
-                    """).rstrip()
-
-        self.execute_queries(sql)
 
 @dagster_maintained_resource
 @resource(

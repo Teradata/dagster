@@ -89,7 +89,7 @@ def test_resources_teradata_connection():
 
             freshness_for_table = fetch_last_updated_timestamps(
                 teradata_connection=conn,
-                database=os.getenv("TERADATA_PASSWORD"),
+                database=os.getenv("TERADATA_DATABASE"),
                 tables=[
                     table_name
                 ],  # Teradata table names are expected uppercase. Test that lowercase also works.
