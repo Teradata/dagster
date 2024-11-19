@@ -1,5 +1,3 @@
-import asyncio
-import re
 from contextlib import closing, contextmanager
 from datetime import datetime
 from textwrap import dedent
@@ -11,7 +9,7 @@ from dagster import (
     ConfigurableResource,
     IAttachDifferentObjectToOpContext,
     get_dagster_logger,
-    resource, DagsterError, DagsterEvent, DagsterEventType, DagsterRun
+    resource,
 )
 from dagster._annotations import public
 from dagster._core.definitions.resource_definition import dagster_maintained_resource
@@ -21,6 +19,8 @@ from dagster_aws.s3 import S3Resource
 from pydantic import Field
 
 from dagster_teradata import constants
+from dagster_teradata.teradata_compute_cluster_manager import TeradataComputeClusterManager
+
 
 class TeradataResource(ConfigurableResource, IAttachDifferentObjectToOpContext):
     host: str = Field(default=None, description="Teradata Database Hostname")
@@ -55,9 +55,7 @@ class TeradataResource(ConfigurableResource, IAttachDifferentObjectToOpContext):
 
     @public
     @contextmanager
-    def get_connection(
-        self
-    ) -> Iterator[Union[SqlDbConnection, teradatasql.TeradataConnection]]:
+    def get_connection(self) -> Iterator[Union[SqlDbConnection, teradatasql.TeradataConnection]]:
         teradata_conn = teradatasql.connect(
             host=self.host,
             user=self.user,
@@ -77,7 +75,6 @@ class TeradataResource(ConfigurableResource, IAttachDifferentObjectToOpContext):
 
 
 class TeradataConnection:
-
     """A connection to Teradata that can execute queries. In general this class should not be
     directly instantiated, but rather used as a resource in an op or asset via the
     :py:func:`teradata_resource`.
@@ -87,16 +84,15 @@ class TeradataConnection:
     """
 
     def __init__(
-            self, config: Mapping[str, str], log, teradata_connection_resource: TeradataResource
+        self, config: Mapping[str, str], log, teradata_connection_resource: TeradataResource
     ):
         self.teradata_connection_resource = teradata_connection_resource
+        self.compute_cluster_manager = TeradataComputeClusterManager(self, log)
         self.log = log
 
     @public
     @contextmanager
-    def get_connection(
-            self
-    ) -> Iterator[Union[SqlDbConnection, teradatasql.TeradataConnection]]:
+    def get_connection(self) -> Iterator[Union[SqlDbConnection, teradatasql.TeradataConnection]]:
         """Gets a connection to Teradata as a context manager.
 
         If using the execute_query, execute_queries, or load_table_from_local_parquet methods,
@@ -125,10 +121,10 @@ class TeradataConnection:
 
     @public
     def execute_query(
-            self,
-            sql: str,
-            fetch_results: bool = False,
-            single_result_row: bool = False,
+        self,
+        sql: str,
+        fetch_results: bool = False,
+        single_result_row: bool = False,
     ):
         """Execute a query in Teradata.
 
@@ -158,9 +154,9 @@ class TeradataConnection:
 
     @public
     def execute_queries(
-            self,
-            sql_queries: Sequence[str],
-            fetch_results: bool = False,
+        self,
+        sql_queries: Sequence[str],
+        fetch_results: bool = False,
     ) -> Optional[Sequence[Any]]:
         """Execute multiple queries in Teradata.
 
@@ -192,12 +188,12 @@ class TeradataConnection:
 
     @public
     def s3_to_teradata(
-            self,
-            s3: S3Resource,
-            s3_source_key: str,
-            teradata_table: str,
-            public_bucket: bool = False,
-            teradata_authorization_name: str = ""
+        self,
+        s3: S3Resource,
+        s3_source_key: str,
+        teradata_table: str,
+        public_bucket: bool = False,
+        teradata_authorization_name: str = "",
     ):
         """Loads CSV, JSON and Parquet format data from Amazon S3 to Teradata.
 
@@ -236,7 +232,6 @@ class TeradataConnection:
                     )
 
         """
-
         credentials_part = "ACCESS_ID= '' ACCESS_KEY= ''"
 
         if not public_bucket:
@@ -265,13 +260,13 @@ class TeradataConnection:
 
     @public
     def azure_blob_to_teradata(
-            self,
-            azure_client_id: str,
-            azure_client_secret: str,
-            blob_source_key: str,
-            teradata_table: str,
-            public_bucket: bool = False,
-            teradata_authorization_name: str = ""
+        self,
+        azure_client_id: str,
+        azure_client_secret: str,
+        blob_source_key: str,
+        teradata_table: str,
+        public_bucket: bool = False,
+        teradata_authorization_name: str = "",
     ):
         """Loads CSV, JSON, and Parquet format data from Azure Blob Storage to Teradata.
 
@@ -289,7 +284,6 @@ class TeradataConnection:
                 Refer to
                 https://docs.teradata.com/r/Enterprise_IntelliFlex_VMware/Teradata-VantageTM-Native-Object-Store-Getting-Started-Guide-17.20/Setting-Up-Access/Controlling-Foreign-Table-Access-with-an-AUTHORIZATION-Object
         """
-
         credentials_part = "ACCESS_ID= '' ACCESS_KEY= ''"
 
         if not public_bucket:
@@ -298,7 +292,9 @@ class TeradataConnection:
                 credentials_part = f"AUTHORIZATION={teradata_authorization_name}"
             else:
                 # Obtaining Azure client ID and secret from the azure_blob resource
-                credentials_part = f"ACCESS_ID= '{azure_client_id}' ACCESS_KEY= '{azure_client_secret}'"
+                credentials_part = (
+                    f"ACCESS_ID= '{azure_client_id}' ACCESS_KEY= '{azure_client_secret}'"
+                )
 
         sql = dedent(f"""
                     CREATE MULTISET TABLE {teradata_table} AS
@@ -321,264 +317,62 @@ class TeradataConnection:
             return records
         raise TypeError(f"Unexpected results: {cursor.fetchone()!r}")
 
-    def verify_compute_cluster(self,
-                               compute_profile_name: str):
-        if (
-                compute_profile_name is None
-                or compute_profile_name == "None"
-                or compute_profile_name == ""
-        ):
-            self.log.info("Invalid compute cluster profile name")
-            raise DagsterError(constants.CC_OPR_EMPTY_PROFILE_ERROR_MSG)
-
-        # Getting teradata db version. Considering teradata instance is Lake when db version is 20 or above
-        db_version_get_sql = "SELECT  InfoData AS Version FROM DBC.DBCInfoV WHERE InfoKey = 'VERSION'"
-        try:
-            db_version_result = self.execute_query(db_version_get_sql, True, True)
-            if db_version_result is not None:
-                db_version_result = str(db_version_result)
-                db_version = db_version_result.split(".")[0]
-                if db_version is not None and int(db_version) < 20:
-                    raise DagsterError(constants.CC_GRP_LAKE_SUPPORT_ONLY_MSG)
-            else:
-                raise Exception("Error occurred while getting teradata database version")
-        except teradatasql.DatabaseError as ex:
-            self.log.error("Error occurred while getting teradata database version: %s ", str(ex))
-            raise Exception("Error occurred while getting teradata database version")
-
-        lake_support_find_sql = "SELECT count(1) from DBC.StorageV WHERE StorageName='TD_OFSSTORAGE'"
-        lake_support_result = self.execute_query(lake_support_find_sql, True, True)
-        if lake_support_result is None:
-            raise DagsterError(constants.CC_GRP_LAKE_SUPPORT_ONLY_MSG)
-
-    def handle_cc_status(self, operation, create_cp_query, compute_profile_name, compute_group_name, timeout) -> str:
-        create_sql_result = self.execute_query(create_cp_query, True, True)
-        self.log.info(
-            "%s query ran successfully. Differing to trigger to check status in db. Result from sql: %s",
-            operation,
-            create_sql_result,
-        )
-
-        try:
-            while True:
-                status = self.get_status(compute_profile_name, compute_group_name)
-                if status is None or len(status) == 0:
-                    self.log.info(constants.CC_GRP_PRP_NON_EXISTS_MSG)
-                    raise DagsterError(constants.CC_GRP_PRP_NON_EXISTS_MSG)
-                if (
-                        operation == constants.CC_SUSPEND_OPR
-                        or operation == constants.CC_CREATE_SUSPEND_OPR
-                ):
-                    if status == constants.CC_SUSPEND_DB_STATUS:
-                        break
-                elif (
-                        operation == constants.CC_RESUME_OPR
-                        or operation == constants.CC_CREATE_OPR
-                ):
-                    if status == constants.CC_RESUME_DB_STATUS:
-                        break
-                if timeout is not None:
-                    timeout = float(timeout)
-                else:
-                    timeout = float(constants.CC_POLL_INTERVAL)
-                asyncio.sleep(timeout)
-            if (
-                    operation == constants.CC_SUSPEND_OPR
-                    or operation == constants.CC_CREATE_SUSPEND_OPR
-            ):
-                if status == constants.CC_SUSPEND_DB_STATUS:
-                    yield DagsterEvent(
-                        {
-                            "job_name" : DagsterRun.job_name,
-                            "event_type_value": DagsterEventType.STEP_SUCCESS,
-                            "message": constants.CC_OPR_SUCCESS_STATUS_MSG
-                                       % (compute_profile_name, operation),
-                        }
-                    )
-                else:
-                    yield DagsterEvent(
-                        {
-                            "job_name": DagsterRun.job_name,
-                            "event_type_value": DagsterEventType.STEP_FAILURE,
-                            "message": constants.CC_OPR_FAILURE_STATUS_MSG
-                                       % (compute_profile_name, operation),
-                        }
-                    )
-            elif (
-                    operation == constants.CC_RESUME_OPR
-                    or operation == constants.CC_CREATE_OPR
-            ):
-                if status == constants.CC_RESUME_DB_STATUS:
-                    yield DagsterEvent(
-                        {
-                            "job_name": DagsterRun.job_name,
-                            "event_type_value": DagsterEventType.STEP_SUCCESS,
-                            "message": constants.CC_OPR_SUCCESS_STATUS_MSG
-                                       % (compute_profile_name, operation),
-                        }
-                    )
-                else:
-                    yield DagsterEvent(
-                        {
-                            "job_name": DagsterRun.job_name,
-                            "event_type_value": DagsterEventType.STEP_FAILURE,
-                            "message": constants.CC_OPR_FAILURE_STATUS_MSG
-                                       % (compute_profile_name, operation),
-                        }
-                    )
-            else:
-                yield DagsterEvent({"status": "error", "message": "Invalid operation"})
-        except Exception as e:
-            yield DagsterError({"status": "error", "message": str(e)})
-        except asyncio.CancelledError:
-            self.log.error(constants.CC_OPR_TIMEOUT_ERROR, operation)
-        return create_sql_result
-
-    def get_status(self, compute_profile_name: str, compute_group_name: str) -> str:
-        sql = (
-                "SEL ComputeProfileState FROM DBC.ComputeProfilesVX WHERE UPPER(ComputeProfileName) = UPPER('"
-                + compute_profile_name
-                + "')"
-        )
-        if compute_group_name:
-            sql += " AND UPPER(ComputeGroupName) = UPPER('" + compute_group_name + "')"
-        result_set = self.execute_query(sql, True, True)
-        status = ""
-        if isinstance(result_set, list) and isinstance(result_set[0], str):
-            status = str(result_set[0])
-        return status
-
-    def get_initially_suspended(self, create_cp_query):
-        initially_suspended = "FALSE"
-        pattern = r"INITIALLY_SUSPENDED\s*\(\s*'(TRUE|FALSE)'\s*\)"
-        # Search for the pattern in the input string
-        match = re.search(pattern, create_cp_query, re.IGNORECASE)
-        if match:
-            # Get the value of INITIALLY_SUSPENDED
-            initially_suspended = match.group(1).strip().upper()
-        return initially_suspended
-
     def create_teradata_compute_cluster(
-            self,
-            compute_profile_name: str,
-            compute_group_name: str,
-            query_strategy: str = "STANDARD",
-            compute_map: str = None,
-            compute_attribute: str = None,
-            timeout: int = constants.CC_OPR_TIME_OUT,
+        self,
+        compute_profile_name: str,
+        compute_group_name: str,
+        query_strategy: str = "STANDARD",
+        compute_map: str = None,
+        compute_attribute: str = None,
+        timeout: int = constants.CC_OPR_TIME_OUT,
     ):
-        """
-        Creates a compute cluster in Teradata by setting up a compute group and profile if they don't already exist.
-
-        Args:
-            compute_profile_name: Name of the Compute Profile to manage.
-            compute_group_name: Name of compute group to which compute profile belongs.
-            query_strategy: Query strategy to use. Refers to the approach or method used by the
-                    Teradata Optimizer to execute SQL queries efficiently within a Teradata computer cluster.
-                    Valid query_strategy value is either 'STANDARD' or 'ANALYTIC'. Default at database level is STANDARD
-            compute_map: ComputeMapName of the compute map. The compute_map in a compute cluster profile refers
-                    to the mapping of compute resources to a specific node or set of nodes within the cluster.
-            compute_attribute: Optional attributes of compute profile. Example compute attribute
-                    MIN_COMPUTE_COUNT(1) MAX_COMPUTE_COUNT(5) INITIALLY_SUSPENDED('FALSE')
-                       compute_attribute (str, optional): Additional attributes for compute profile. Defaults to None.
-        """
-
-        self.verify_compute_cluster(compute_profile_name)
-
-        if compute_group_name:
-            # Step 1: Check if the compute group exists
-            check_compute_group_sql = dedent(f"""
-                SELECT count(1) FROM DBC.ComputeGroups 
-                WHERE UPPER(ComputeGroupName) = UPPER('{compute_group_name}')
-            """)
-            cg_status_result = self.execute_query(check_compute_group_sql, True, True)
-            if cg_status_result is not None:
-                cg_status_result = str(cg_status_result)
-            else:
-                cg_status_result = 0
-
-            # Step 2: Create the compute group if it doesn't exist
-            if int(cg_status_result) == 0:
-                create_cg_query = "CREATE COMPUTE GROUP " + compute_group_name
-                if query_strategy is not None:
-                    create_cg_query = (
-                        create_cg_query + " USING QUERY_STRATEGY ('" + query_strategy + "')"
-                    )
-                self.execute_query(create_cg_query)
-
-        # Step 3: Check if the compute profile exists within the compute group
-        cp_status_query = (
-                "SEL ComputeProfileState FROM DBC.ComputeProfilesVX WHERE UPPER(ComputeProfileName) = UPPER('"
-                + compute_profile_name
-                + "')"
+        return self.compute_cluster_manager.create_teradata_compute_cluster(
+            compute_profile_name,
+            compute_group_name,
+            query_strategy,
+            compute_map,
+            compute_attribute,
+            timeout,
         )
-        if compute_group_name:
-            cp_status_query += " AND UPPER(ComputeGroupName) = UPPER('" + compute_group_name + "')"
-        cp_status_result = self.execute_query(cp_status_query, True, True)
-        if cp_status_result is not None:
-            cp_status_result = str(cp_status_result)
-            msg = f"Compute Profile {compute_profile_name} is already exists under Compute Group {compute_group_name}. Status is {cp_status_result}"
-            self.log.info(msg)
-            return cp_status_result
-        else:
-            create_cp_query = "CREATE COMPUTE PROFILE " + compute_profile_name
-            if compute_group_name:
-                create_cp_query = create_cp_query + " IN " + compute_group_name
-            if compute_map is not None:
-                create_cp_query = create_cp_query + ", INSTANCE = " + compute_map
-            if query_strategy is not None:
-                create_cp_query = create_cp_query + ", INSTANCE TYPE = " + query_strategy
-            if compute_attribute is not None:
-                create_cp_query = create_cp_query + " USING " + compute_attribute
-            operation = constants.CC_CREATE_OPR
-            initially_suspended = self.get_initially_suspended(create_cp_query)
-            if initially_suspended == "TRUE":
-                operation = constants.CC_CREATE_SUSPEND_OPR
-            for event in self.handle_cc_status(operation, create_cp_query, compute_profile_name, compute_group_name,
-                                               timeout):
-                self.log.info(event)
-
 
     def drop_teradata_compute_cluster(
-            self,
-            compute_profile_name: str,
-            compute_group_name: str,
-            delete_compute_group: bool = False,
+        self,
+        compute_profile_name: str,
+        compute_group_name: str,
+        delete_compute_group: bool = False,
     ):
-        """
-        Drops a compute cluster in Teradata by removing the compute profile and group.
+        return self.compute_cluster_manager.drop_teradata_compute_cluster(
+            compute_profile_name,
+            compute_group_name,
+            delete_compute_group,
+        )
 
-        Args:
-            compute_profile_name: Name of the Compute Profile to manage.
-            compute_group_name: Name of compute group to which compute profile belongs.
-            delete_compute_group: Indicates whether the compute group should be deleted.
-                When set to True, it signals the system to remove the specified compute group.
-                Conversely, when set to False, no action is taken on the compute group.
-        """
-
-        self.verify_compute_cluster(compute_profile_name)
-
-        cp_drop_query = "DROP COMPUTE PROFILE " + compute_profile_name
-        if compute_group_name:
-            cp_drop_query = cp_drop_query + " IN COMPUTE GROUP " + compute_group_name
-        self.execute_query(cp_drop_query)
-        self.log.info(
-            "Compute Profile %s IN Compute Group %s is successfully dropped",
+    def resume_teradata_compute_cluster(
+        self,
+        compute_profile_name: str,
+        compute_group_name: str,
+    ):
+        return self.compute_cluster_manager.resume_teradata_compute_cluster(
             compute_profile_name,
             compute_group_name,
         )
-        if delete_compute_group:
-            cg_drop_query = "DROP COMPUTE GROUP " + compute_group_name
-            self.execute_query(cg_drop_query)
-            self.log.info("Compute Group %s is successfully dropped", compute_group_name)
+
+    def suspend_teradata_compute_cluster(
+        self,
+        compute_profile_name: str,
+        compute_group_name: str,
+    ):
+        return self.compute_cluster_manager.suspend_teradata_compute_cluster(
+            compute_profile_name,
+            compute_group_name,
+        )
+
 
 @dagster_maintained_resource
 @resource(
     config_schema=TeradataResource.to_config_schema(),
     description="This resource is for connecting to the Teradata Vantage",
 )
-
-
 def teradata_resource(context) -> TeradataConnection:
     """A resource for connecting to the Teradata Vantage. The returned resource object is an
     instance of :py:class:`TeradataConnection`.
@@ -621,10 +415,10 @@ def teradata_resource(context) -> TeradataConnection:
 
 
 def fetch_last_updated_timestamps(
-        *,
-        teradata_connection: Union[SqlDbConnection, teradatasql.TeradataConnection],
-        tables: Sequence[str],
-        database: Optional[str] = None,
+    *,
+    teradata_connection: Union[SqlDbConnection, teradatasql.TeradataConnection],
+    tables: Sequence[str],
+    database: Optional[str] = None,
 ) -> Mapping[str, datetime]:
     """Fetch the last updated times of a list of tables in Teradata.
 

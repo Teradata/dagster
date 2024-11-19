@@ -1,7 +1,6 @@
 from abc import abstractmethod
 from contextlib import contextmanager
-
-from typing import Any, Dict, Optional, Sequence, Type, cast
+from typing import Optional, Sequence, Type, cast
 
 from dagster import IOManagerDefinition, OutputContext, io_manager
 from dagster._config.pythonic_config import ConfigurableIOManagerFactory
@@ -14,11 +13,9 @@ from dagster._core.storage.db_io_manager import (
     TableSlice,
 )
 from dagster._core.storage.io_manager import dagster_maintained_io_manager
-from dagster._utils.backoff import backoff
-from packaging.version import Version
 from pydantic import Field
-
 from teradatasql import ProgrammingError
+
 from dagster_teradata.resources import TeradataResource
 
 TERADATA_DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -47,10 +44,10 @@ class TeradataIOManager(ConfigurableIOManagerFactory):
     user: str = Field(description="User login name.")
     database: str = Field(description="Name of the database to use.")
     password: Optional[str] = Field(default=None, description="User password.")
+
     @staticmethod
     @abstractmethod
-    def type_handlers() -> Sequence[DbTypeHandler]:
-        ...
+    def type_handlers() -> Sequence[DbTypeHandler]: ...
 
     @staticmethod
     def default_load_type() -> Optional[Type]:
@@ -95,10 +92,7 @@ class TeradataDbClient(DbClient):
     def get_select_statement(table_slice: TableSlice) -> str:
         col_str = ", ".join(table_slice.columns) if table_slice.columns else "*"
         if table_slice.partition_dimensions and len(table_slice.partition_dimensions) > 0:
-            query = (
-                f"SELECT {col_str} FROM"
-                f" {table_slice.database}.{table_slice.table} WHERE\n"
-            )
+            query = f"SELECT {col_str} FROM" f" {table_slice.database}.{table_slice.table} WHERE\n"
             return query + _partition_where_clause(table_slice.partition_dimensions)
         else:
             return f"""SELECT {col_str} FROM {table_slice.database}.{table_slice.table}"""
@@ -109,9 +103,7 @@ def _get_cleanup_statement(table_slice: TableSlice) -> str:
     being written.
     """
     if table_slice.partition_dimensions and len(table_slice.partition_dimensions) > 0:
-        query = (
-            f"DELETE FROM {table_slice.database}.{table_slice.table} WHERE\n"
-        )
+        query = f"DELETE FROM {table_slice.database}.{table_slice.table} WHERE\n"
         return query + _partition_where_clause(table_slice.partition_dimensions)
     else:
         return f"DELETE FROM {table_slice.database}.{table_slice.table}"
