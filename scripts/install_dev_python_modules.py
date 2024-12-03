@@ -104,6 +104,7 @@ def main(
         "python_modules/libraries/dagster-snowflake-pandas",
         "python_modules/libraries/dagster-spark",
         "python_modules/libraries/dagster-ssh",
+        "python_modules/libraries/dagster-teradata",
         "python_modules/libraries/dagster-twilio",
         "python_modules/libraries/dagstermill",
     ]
