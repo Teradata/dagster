@@ -334,6 +334,7 @@ class TeradataComputeClusterSync:
             yield DagsterError(str(e))
         except asyncio.CancelledError:
             self.log.error(constants.CC_OPR_TIMEOUT_ERROR, self.operation)
+            yield DagsterError(constants.CC_OPR_TIMEOUT_ERROR, self.operation)
 
     def get_status(self) -> str:
         """Return compute cluster SUSPEND/RESUME operation status."""

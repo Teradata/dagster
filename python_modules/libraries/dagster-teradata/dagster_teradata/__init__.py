@@ -1,7 +1,7 @@
 from dagster._core.libraries import DagsterLibraryRegistry
 
 from dagster_teradata.resources import (
-    TeradataConnection as TeradataConnection,
+    TeradataDagsterConnection as TeradataDagsterConnection,
     TeradataResource as TeradataResource,
     fetch_last_updated_timestamps as fetch_last_updated_timestamps,
     teradata_resource as teradata_resource,

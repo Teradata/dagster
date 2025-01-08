@@ -1,31 +1,16 @@
 import os
 import uuid
-import pandas as pd
-import teradatasql
+
 import pytest
-from unittest import mock
-from contextlib import contextmanager
-from typing import Iterator
-from dagster import (
-    DagsterInstance,
-    DagsterResourceFunctionError,
-    DataVersion,
-    EnvVar,
-    ObserveResult,
-    build_resources,
-    job,
-    observable_source_asset,
-    op,
-    asset,
-    materialize,
-)
+import teradatasql
+from dagster import asset, materialize
 from dagster._time import get_current_timestamp
-from dagster_aws.s3 import S3Resource
-from dagster_teradata import TeradataResource, fetch_last_updated_timestamps, teradata_resource
+from dagster_teradata import TeradataResource, fetch_last_updated_timestamps
+
 
 @pytest.mark.integration
 def test_resource(tmp_path):
-    df = ['a']
+    df = ["a"]
 
     @asset
     def drop_table(teradata: TeradataResource):
@@ -35,17 +20,15 @@ def test_resource(tmp_path):
         except teradatasql.DatabaseError as e:
             # Error code 3807 corresponds to "table does not exist" in Teradata
             if "3807" in str(e):
-                print("Table dbcinfo does not exist, ignoring error 3807.")
+                pass
             else:
                 # Re-raise the exception if it's not error 3807
                 raise
-
 
     @asset
     def create_table(teradata: TeradataResource, drop_table):
         with teradata.get_connection() as conn:
             conn.cursor().execute("CREATE TABLE dbcinfo (infokey varchar(50));")
-
 
     @asset
     def insert_rows(teradata: TeradataResource, create_table):
@@ -59,17 +42,20 @@ def test_resource(tmp_path):
             cursor.execute("select * from dbcinfo;")
             res = cursor.fetchall()
             result_list = [row[0] for row in res]
-            assert result_list==df
-
+            assert result_list == df
 
     materialize(
         [drop_table, create_table, insert_rows, read_table],
-        resources={"teradata": TeradataResource(
-            host=os.getenv("TERADATA_HOST"),
-            user=os.getenv("TERADATA_USER"),
-            password=os.getenv("TERADATA_PASSWORD"),
-            database=os.getenv("TERADATA_DATABASE"))},
+        resources={
+            "teradata": TeradataResource(
+                host=os.getenv("TERADATA_HOST"),
+                user=os.getenv("TERADATA_USER"),
+                password=os.getenv("TERADATA_PASSWORD"),
+                database=os.getenv("TERADATA_DATABASE"),
+            )
+        },
     )
+
 
 @pytest.mark.integration
 def test_resources_teradata_connection():
@@ -95,13 +81,15 @@ def test_resources_teradata_connection():
                 ],  # Teradata table names are expected uppercase. Test that lowercase also works.
             )[table_name].timestamp()
 
-            end_time = get_current_timestamp()
+            # end_time = get_current_timestamp()
 
             assert freshness_for_table > start_time
         finally:
             try:
-                conn.cursor().execute(f"drop table if exists {table_name}")
+                conn.cursor().execute(f"drop table {table_name}")
             except Exception as ex:
-                ignored = False
-                if f"[Error 3807]" in str(ex):
-                    ignored = True
+                if "3807" in str(ex):
+                    pass
+                else:
+                    # Re-raise the exception if it's not error 3807
+                    raise

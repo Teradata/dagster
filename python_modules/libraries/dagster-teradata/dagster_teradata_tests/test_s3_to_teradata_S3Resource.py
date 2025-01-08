@@ -1,10 +1,9 @@
 import os
 
-import boto3
 import pytest
-from dagster import job, op, Definitions
-from dagster_teradata import teradata_resource, TeradataResource
+from dagster import job, op
 from dagster_aws.s3 import S3Resource
+from dagster_teradata import TeradataResource, teradata_resource
 
 s3_resource = S3Resource(
     aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
@@ -19,16 +18,17 @@ teradata_resource = TeradataResource(
     database = os.getenv('TERADATA_DATABASE'),
 )
 
+
 @pytest.mark.integration
 def test_s3_to_teradata(tmp_path):
     @op(required_resource_keys={"teradata", "s3"})
     def example_test_s3_to_teradata(context):
-        context.resources.teradata.s3_to_teradata(s3_resource,
-                                                  '/s3/mt255026-test.s3.amazonaws.com/people.csv', 'people')
+        context.resources.teradata.s3_to_teradata(
+            s3_resource, os.getenv('AWS_S3_LOCATION'), "people"
+        )
 
     @job(resource_defs={"teradata": teradata_resource, "s3": s3_resource})
     def example_job():
         example_test_s3_to_teradata()
 
-    example_job.execute_in_process(
-            resources={"s3": s3_resource, "teradata": teradata_resource})
+    example_job.execute_in_process(resources={"s3": s3_resource, "teradata": teradata_resource})

@@ -38,6 +38,7 @@ setup(
         "pytest",
         "pandas",
         "dagster-aws",
+        "dagster-azure",
         "teradatasql",
     ],
     zip_safe=False,
