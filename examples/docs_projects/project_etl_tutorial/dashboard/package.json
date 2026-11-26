@@ -16,7 +16,7 @@
   },
   "type": "module",
   "dependencies": {
-    "@evidence-dev/bigquery": "^2.0.10",
+    "@evidence-dev/bigquery": "^2.0.12",
     "@evidence-dev/core-components": "^5.2.2",
     "@evidence-dev/csv": "^1.0.14",
     "@evidence-dev/databricks": "^1.0.8",
